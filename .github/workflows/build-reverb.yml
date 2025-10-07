@@ -1,0 +1,107 @@
+name: "Build Reverb"
+
+on:
+  schedule:
+    - cron: '0 0 * * *'  # Daily at midnight UTC
+  workflow_dispatch:
+
+env:
+  AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+  AWS_DEFAULT_REGION: us-east-1
+  R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+  R2_BUCKET: ${{ secrets.R2_BUCKET_NAME }}
+
+jobs:
+  build-reverb:
+    name: "Build and Deploy Reverb"
+    runs-on: macos-latest
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v5
+
+      - name: "Setup PHP"
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: 8.3
+
+      - name: "Prepare environment"
+        run: |
+          cp .env.example .env
+
+      - name: "Install dependencies"
+        run: composer install --no-dev --optimize-autoloader
+
+      - name: "Generate application key"
+        run: php artisan key:generate
+
+      - name: "Extract Reverb version"
+        id: version
+        run: |
+          VERSION=$(composer show laravel/reverb --format=json | jq -r '.versions[0]')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Reverb version: $VERSION"
+
+      - name: "Generate timestamp"
+        id: timestamp
+        run: |
+          TIMESTAMP=$(date -u +"%Y%m%d%H%M%S")
+          echo "timestamp=$TIMESTAMP" >> $GITHUB_OUTPUT
+          echo "Generated timestamp: $TIMESTAMP"
+
+      - name: "Create archive"
+        run: |
+          TIMESTAMP="${{ steps.timestamp.outputs.timestamp }}"
+          ARCHIVE_NAME="reverb-${TIMESTAMP}.tar.xz"
+
+          # Archive everything except .git and .github
+          tar -cJf "$ARCHIVE_NAME" \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='tests' \
+            --exclude='node_modules' \
+            .
+
+          echo "ARCHIVE_NAME=$ARCHIVE_NAME" >> $GITHUB_ENV
+          echo "Created archive: $ARCHIVE_NAME ($(du -h "$ARCHIVE_NAME" | cut -f1))"
+
+      - name: "Calculate SHA512"
+        run: |
+          SHA512=$(sha512sum "$ARCHIVE_NAME" | awk '{print $1}')
+          echo "SHA512=$SHA512" >> $GITHUB_ENV
+          echo "SHA512: $SHA512"
+
+      - name: "Upload archive to R2"
+        run: |
+          aws s3 cp "$ARCHIVE_NAME" s3://$R2_BUCKET/"$ARCHIVE_NAME" --endpoint-url $R2_ENDPOINT
+          echo "Uploaded $ARCHIVE_NAME to R2"
+
+      - name: "Update metadata-reverb.json"
+        run: |
+          # Download existing metadata or create empty
+          aws s3 cp s3://$R2_BUCKET/metadata-reverb.json metadata-reverb.json --endpoint-url $R2_ENDPOINT 2>/dev/null || echo '{}' > metadata-reverb.json
+
+          # Update metadata with new version
+          jq --arg version "${{ steps.version.outputs.version }}" \
+             --arg sha512 "$SHA512" \
+             --arg filename "$ARCHIVE_NAME" \
+             '.reverb = {latest: $version, sha512: $sha512, filename: $filename}' \
+             metadata-reverb.json > metadata-reverb.json.tmp && mv metadata-reverb.json.tmp metadata-reverb.json
+
+          echo "Updated metadata-reverb.json:"
+          cat metadata-reverb.json
+
+      - name: "Upload metadata to R2"
+        run: aws s3 cp metadata-reverb.json s3://$R2_BUCKET/metadata-reverb.json --endpoint-url $R2_ENDPOINT
+
+      - name: "Cleanup old builds"
+        run: |
+          echo "Cleaning up old Reverb builds (keeping only current: $ARCHIVE_NAME)..."
+          aws s3api list-objects-v2 \
+            --bucket $R2_BUCKET \
+            --prefix "reverb-" \
+            --endpoint-url $R2_ENDPOINT \
+            --query 'Contents[].Key' \
+            --output text | tr '\t' '\n' | while read -r file_key; do
+            [[ "$file_key" =~ ^reverb-.*\.tar\.xz$ ]] && [[ "$file_key" != "$ARCHIVE_NAME" ]] && aws s3 rm s3://$R2_BUCKET/"$file_key" --endpoint-url $R2_ENDPOINT
+          done
