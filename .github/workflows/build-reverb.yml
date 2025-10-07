@@ -35,6 +35,11 @@ jobs:
       - name: "Generate application key"
         run: php artisan key:generate
 
+      - name: "Setup database"
+        run: |
+          touch database/database.sqlite
+          php artisan migrate --force
+
       - name: "Extract Reverb version"
         id: version
         run: |
@@ -97,11 +102,18 @@ jobs:
       - name: "Cleanup old builds"
         run: |
           echo "Cleaning up old Reverb builds (keeping only current: $ARCHIVE_NAME)..."
+
           aws s3api list-objects-v2 \
             --bucket $R2_BUCKET \
             --prefix "reverb-" \
             --endpoint-url $R2_ENDPOINT \
             --query 'Contents[].Key' \
             --output text | tr '\t' '\n' | while read -r file_key; do
-            [[ "$file_key" =~ ^reverb-.*\.tar\.xz$ ]] && [[ "$file_key" != "$ARCHIVE_NAME" ]] && aws s3 rm s3://$R2_BUCKET/"$file_key" --endpoint-url $R2_ENDPOINT
+
+            if [[ "$file_key" =~ ^reverb-.*\.tar\.xz$ ]] && [[ "$file_key" != "$ARCHIVE_NAME" ]]; then
+              echo "Deleting old build: $file_key"
+              aws s3 rm s3://$R2_BUCKET/"$file_key" --endpoint-url $R2_ENDPOINT || true
+            fi
           done
+
+          echo "Cleanup completed"
