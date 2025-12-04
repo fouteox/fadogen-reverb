@@ -1,8 +1,8 @@
 name: "Build Reverb"
 
 on:
-#  schedule:
-#    - cron: '0 0 * * *'  # Daily at midnight UTC
+  schedule:
+    - cron: '0 0 * * *'  # Daily at midnight UTC
   workflow_dispatch:
 
 env:
@@ -13,9 +13,47 @@ env:
   R2_BUCKET: ${{ secrets.R2_BUCKET_NAME }}
 
 jobs:
+  check-version:
+    name: "Check for new Reverb version"
+    runs-on: ubuntu-latest
+    outputs:
+      new_version_available: ${{ steps.compare.outputs.new_version_available }}
+      latest_version: ${{ steps.compare.outputs.latest_version }}
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v5
+
+      - name: "Get current and latest versions"
+        id: compare
+        run: |
+          # Current version from composer.json
+          CURRENT=$(jq -r '.require["laravel/reverb"]' composer.json | sed 's/[\^~]//')
+
+          # Latest GitHub release
+          LATEST=$(curl -s https://api.github.com/repos/laravel/reverb/releases/latest | \
+            jq -r '.tag_name' | \
+            sed 's/^v//')
+
+          echo "Current: $CURRENT"
+          echo "Latest: $LATEST"
+
+          if [ "$CURRENT" != "$LATEST" ]; then
+            echo "new_version_available=true" >> $GITHUB_OUTPUT
+          else
+            echo "new_version_available=false" >> $GITHUB_OUTPUT
+          fi
+          echo "latest_version=$LATEST" >> $GITHUB_OUTPUT
+
   build-reverb:
     name: "Build and Deploy Reverb"
+    needs: check-version
+    if: |
+      needs.check-version.outputs.new_version_available == 'true' ||
+      github.event_name == 'workflow_dispatch'
     runs-on: macos-latest
+    permissions:
+      contents: write
+      pull-requests: write
     steps:
       - name: "Checkout"
         uses: actions/checkout@v5
@@ -29,8 +67,40 @@ jobs:
         run: |
           cp .env.example .env
 
+      - name: "Update composer.json with new version"
+        if: needs.check-version.outputs.new_version_available == 'true'
+        run: |
+          NEW_VERSION="${{ needs.check-version.outputs.latest_version }}"
+          jq --arg v "^$NEW_VERSION" '.require["laravel/reverb"] = $v' composer.json > tmp.json
+          mv tmp.json composer.json
+          echo "Updated laravel/reverb to ^$NEW_VERSION"
+
       - name: "Install dependencies"
-        run: composer install --no-dev --optimize-autoloader
+        run: composer update --no-dev --optimize-autoloader
+
+      - name: "Create PR"
+        if: needs.check-version.outputs.new_version_available == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          NEW_VERSION="${{ needs.check-version.outputs.latest_version }}"
+          BRANCH="chore/bump-reverb-$NEW_VERSION"
+
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+
+          git checkout -b "$BRANCH"
+          git add composer.json composer.lock
+          git commit -m "chore: bump laravel/reverb to $NEW_VERSION"
+          git push -u origin "$BRANCH"
+
+          PR_URL=$(gh pr create \
+            --title "chore: bump laravel/reverb to $NEW_VERSION" \
+            --body "Automated version bump for laravel/reverb to $NEW_VERSION" \
+            --base main \
+            --head "$BRANCH")
+
+          echo "PR_URL=$PR_URL" >> $GITHUB_ENV
 
       - name: "Generate application key"
         run: php artisan key:generate
@@ -117,3 +187,9 @@ jobs:
           done
 
           echo "Cleanup completed"
+
+      - name: "Enable auto-merge"
+        if: needs.check-version.outputs.new_version_available == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh pr merge --auto --squash --delete-branch "$PR_URL"
