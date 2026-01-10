@@ -81,13 +81,24 @@ jobs:
       - name: "Create PR"
         if: needs.check-version.outputs.new_version_available == 'true'
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
           NEW_VERSION="${{ needs.check-version.outputs.latest_version }}"
           BRANCH="chore/bump-reverb-$NEW_VERSION"
 
+          # Vérifier si une PR existe déjà pour cette version
+          EXISTING_PR=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number // empty')
+          if [ -n "$EXISTING_PR" ]; then
+            echo "PR #$EXISTING_PR already exists for $BRANCH, skipping creation"
+            echo "PR_URL=https://github.com/${{ github.repository }}/pull/$EXISTING_PR" >> $GITHUB_ENV
+            exit 0
+          fi
+
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+
+          # Supprimer la branche distante si elle existe
+          git push origin --delete "$BRANCH" 2>/dev/null || true
 
           git checkout -b "$BRANCH"
           git add composer.json composer.lock
@@ -191,5 +202,5 @@ jobs:
       - name: "Enable auto-merge"
         if: needs.check-version.outputs.new_version_available == 'true'
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.GH_PAT }}
         run: gh pr merge --auto --squash --delete-branch "$PR_URL"
